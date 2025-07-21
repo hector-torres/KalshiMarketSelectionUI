@@ -45,14 +45,14 @@ class MarketDashboard:
 
     def render(self):
         # — Sidebar: Search & Filters —
-        st.sidebar.header("🔎 Search & Filters")
-        search_term = st.sidebar.text_input("Search title / subtitle / event…")
+        st.sidebar.header("Search & Filters")
+        search_term = st.sidebar.text_input("Search")
 
         # — Sidebar: Category Filter —
         cats = sorted(self.df["category"].dropna().unique())
         selected_cats = st.sidebar.multiselect("Category", options=cats, default=cats)
         # — Sidebar: Time-to-Close Filter —
-        st.sidebar.header("⏳ Time to Close")
+        st.sidebar.header("Time to Close")
         # Determine maximum days to close from data
         max_close_val = int(self.df["days_to_close"].max())
         min_days, max_days = st.sidebar.slider(
@@ -65,7 +65,7 @@ class MarketDashboard:
         )
 
         # — Sidebar: Price Range Filter —
-        st.sidebar.header("💲 Price Range (Yes last trade)")
+        st.sidebar.header("Price Range")
         price_min, price_max = st.sidebar.slider(
             "Price range ($)",
             min_value=0.00,
@@ -77,7 +77,8 @@ class MarketDashboard:
 
         # — Sidebar: Pagination —
         st.sidebar.header("📄 Pagination")
-        page_size = st.sidebar.number_input("Rows per page", 1, 100, 10, step=1)
+        # page_size = st.sidebar.number_input("Rows per page", 1, 100, 10, step=1)
+        page_size = 10
 
         # — Apply Filters —
         df_filtered = self.df.copy()
@@ -106,7 +107,7 @@ class MarketDashboard:
         df_page = df_filtered.iloc[start:end]
 
         # — Main View: Table & Selections —
-        st.title("📊 Market Events Dashboard")
+        st.title("Market Events Dashboard")
         st.write(f"Showing rows {start + 1}–{min(end, total)} of {total}")
 
         # Add display column for price
@@ -143,12 +144,12 @@ class MarketDashboard:
         sel = pd.DataFrame(grid_response["selected_rows"])
         if not sel.empty:
             st.markdown("---")
-            st.subheader("🔍 Selected for Analysis")
+            st.subheader("Selected for Analysis")
             st.dataframe(
                 sel[["market_event_ticker", "title", "sub_title", "event_title", "category"]],
                 use_container_width=True
             )
-            if st.button("💾 Save Selected to Archive"):
+            if st.button("Save Selected to Archive"):
                 n = self.db.archive(sel)
                 st.success(f"Saved {n} new rows to archive DB.")
 
