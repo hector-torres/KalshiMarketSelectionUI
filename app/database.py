@@ -4,16 +4,15 @@ import requests
 import pandas as pd
 import json
 import logging
+import time
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-
 class Database:
     def __init__(self):
         load_dotenv()
-
         # Debug levels:
         # 0 (default) = normal daily refresh
         # 1 = force refresh every run (always call API)
@@ -39,9 +38,6 @@ class Database:
         if not self.archive_path:
             raise RuntimeError('ARCHIVE_DATABASE_URL must be set in .env')
 
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
     def get_conn(self):
         """Ensure cache policy, then return a connection."""
         self._refresh_markets_if_needed()
@@ -105,9 +101,6 @@ class Database:
         conn.close()
         return inserted
 
-    # ------------------------------------------------------------------ #
-    # Internal refresh policy
-    # ------------------------------------------------------------------ #
     def _refresh_markets_if_needed(self):
         """
         Refresh policy:
@@ -122,12 +115,9 @@ class Database:
         cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
 
-        # Current table & schema
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='markets'")
         table_exists = cur.fetchone() is not None
-
         required = {'ticker', 'subtitle', 'open_time', 'close_time', 'last_price'}
-
         if table_exists:
             cur.execute("PRAGMA table_info(markets)")
             existing_cols = {r[1] for r in cur.fetchall()}
@@ -135,41 +125,35 @@ class Database:
         else:
             schema_ok = False
 
-        # Last refresh timestamp
         cur.execute("SELECT value FROM metadata WHERE key='last_refresh'")
         row = cur.fetchone()
         last_refresh = datetime.fromisoformat(row[0]) if row else None
         stale = (not last_refresh) or (datetime.now() - last_refresh > timedelta(days=1))
 
         if self.debug_level == 2:
-            # Offline mode
             if not schema_ok:
                 logger.info("DEBUG=2 (offline) but table missing/incomplete -> performing one-time fetch.")
                 self._fetch_and_rebuild(cur, conn)
             else:
-                if self.debug_level:
-                    logger.info("DEBUG=2: using cached markets (no API call).")
-                # Optionally warn if empty
+                logger.info("DEBUG=2: using cached markets (no API call).")
                 count = cur.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
                 if count == 0:
                     logger.warning("DEBUG=2: markets table empty.")
         else:
             must_refresh = (
-                self.debug_level == 1  # force
+                self.debug_level == 1
                 or not table_exists
                 or stale
                 or not schema_ok
             )
             if must_refresh:
-                if self.debug_level:
-                    logger.info(
-                        f"Refreshing markets (debug_level={self.debug_level}, "
-                        f"table_exists={table_exists}, stale={stale}, schema_ok={schema_ok})"
-                    )
+                logger.info(
+                    f"Refreshing markets (debug_level={self.debug_level}, "
+                    f"table_exists={table_exists}, stale={stale}, schema_ok={schema_ok})"
+                )
                 self._fetch_and_rebuild(cur, conn)
             else:
-                if self.debug_level:
-                    logger.info("Markets cache is fresh – no refresh needed.")
+                logger.info("Markets cache is fresh – no refresh needed.")
 
         conn.close()
 
@@ -200,8 +184,40 @@ class Database:
             if not cursor_token:
                 break
 
-        if self.debug_level:
-            logger.info(f"Total markets fetched: {len(all_markets)}")
+        logger.info(f"Total markets fetched: {len(all_markets)}")
+
+        # Enrich categories by series lookup
+        series_set = {m.get('event_ticker', '').split('-', 1)[0] for m in all_markets}
+        series_to_category = {}
+        count = 0
+        for series in series_set:
+            count += 1
+            try:
+                resp = requests.get(
+                    f"https://api.elections.kalshi.com/trade-api/v2/series/{series}",
+                    timeout=10
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                category_val = data.get('series', {}).get('category', '')
+                series_to_category[series] = category_val
+            except Exception as e:
+                logger.warning(f"Error fetching category for series {series}: {e}")
+            finally:
+                time.sleep(.12)
+
+            if count == 1:
+                logger.info(
+                    f"Fetched category data for 1 series: category={category_val}, response={data}"
+                )
+            elif count % 50 == 0:
+                logger.info(f"Fetched category data for {count} series")
+
+        logger.info(f"Series API calls: {len(series_to_category)}")
+
+        for m in all_markets:
+            base = m.get('event_ticker', '').split('-', 1)[0]
+            m['category'] = series_to_category.get(base, '')
 
         # Define schema
         schema_fields = [
@@ -220,7 +236,6 @@ class Database:
             ('rules_primary', 'TEXT'), ('rules_secondary', 'TEXT')
         ]
 
-        # Rebuild table
         cur.execute("DROP TABLE IF EXISTS markets")
         cols_sql = ", ".join(f"{name} {typ}" for name, typ in schema_fields)
         cur.execute(f"CREATE TABLE markets ({cols_sql})")
@@ -240,9 +255,8 @@ class Database:
                     row_vals.append(m.get(col))
             cur.execute(insert_sql, row_vals)
 
-        # Update metadata
         cur.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_refresh', ?)",
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_refresh', ?)" ,
             (datetime.now().isoformat(),)
         )
         conn.commit()
