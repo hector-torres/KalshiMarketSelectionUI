@@ -2,3 +2,4 @@ streamlit
 pandas
 streamlit-aggrid
 python-dotenv
+openpyxl

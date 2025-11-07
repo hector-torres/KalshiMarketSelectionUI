@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder
+import io
 
 from app.database import Database
 
@@ -87,7 +88,7 @@ class MarketDashboard:
             "Price range ($)",
             min_value=0.00,
             max_value=0.99,
-            value=(0.00, 0.50),
+            value=(0.00, 0.99),
             step=0.01,
             help="Filter markets by last Yes price in dollars"
         )
@@ -117,6 +118,26 @@ class MarketDashboard:
 
         # Price range filter
         df_filtered = df_filtered[df_filtered["last_price_dollars"].between(price_min, price_max)]
+
+        # — Sidebar: Export (Excel) —
+        export_cols = [
+            "market_event_ticker", "title", "sub_title", "event_title",
+            "category", "open_time", "close_time", "days_to_close",
+            "last_price_dollars"
+        ]
+        export_cols = [c for c in export_cols if c in df_filtered.columns]
+        df_export = df_filtered.loc[:, export_cols].copy()
+        df_export["last_price_dollars"] = df_export["last_price_dollars"].round(2)
+
+        xlsx_bytes = self._to_excel_bytes(df_export)
+        fname = f"markets_filtered_{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d_%H%M%S')}Z.xlsx"
+        st.sidebar.download_button(
+            label="Download filtered as Excel (.xlsx)",
+            data=xlsx_bytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Exports all rows matching current filters (not just the current page)."
+        )
 
         # Pagination
         total = len(df_filtered)
@@ -188,6 +209,13 @@ class MarketDashboard:
                 st.write("**Event Title:**", row.event_title)
                 st.write("**Market Rules:**", row.market_rules_primary)
                 st.write("**Category:**", row.category)
+
+    def _to_excel_bytes(self, df: pd.DataFrame) -> bytes:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="markets")
+        buf.seek(0)
+        return buf.getvalue()
 
     def run(self):
         self.load_data()
