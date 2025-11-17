@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,64 @@ class Database:
         conn.close()
         return inserted
 
+    def get_last_update_cutoff(self):
+        """
+        Returns a pandas.Timestamp (UTC) to use as the cutoff for
+        'opened since last update'. If we have a previous refresh time, use that,
+        otherwise fall back to the last refresh time.
+        """
+        import pandas as pd
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+
+        cur.execute("SELECT value FROM metadata WHERE key='prev_refresh'")
+        prev_row = cur.fetchone()
+        cur.execute("SELECT value FROM metadata WHERE key='last_refresh'")
+        last_row = cur.fetchone()
+        conn.close()
+
+        # Prefer previous refresh if available (captures “since last run” after a rebuild)
+        raw = prev_row[0] if (prev_row and prev_row[0]) else (last_row[0] if last_row else None)
+        if not raw:
+            return None
+        # Coerce to UTC-aware pandas.Timestamp
+        try:
+            ts = pd.to_datetime(raw, utc=True, errors="coerce", exact=False)
+            return ts
+        except Exception:
+            return None
+
+    def get_last_refresh_time(self):
+        """Return the last_refresh timestamp as a UTC-aware pandas.Timestamp, or None."""
+        import pandas as pd
+        from datetime import timezone
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+
+        cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+
+        cur.execute("SELECT value FROM metadata WHERE key='last_refresh'")
+        row = cur.fetchone()
+        conn.close()
+
+        if not row or not row[0]:
+            return None
+
+        try:
+            ts = pd.to_datetime(row[0], utc=True, errors="coerce", exact=False)
+        except Exception:
+            return None
+
+        # Attach UTC if naive
+        if ts and ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+
+        return ts
+
     def _refresh_markets_if_needed(self):
         """
         Refresh policy:
@@ -125,10 +183,24 @@ class Database:
         else:
             schema_ok = False
 
+        # Read last_refresh (may be naive or aware depending on past writes)
         cur.execute("SELECT value FROM metadata WHERE key='last_refresh'")
         row = cur.fetchone()
-        last_refresh = datetime.fromisoformat(row[0]) if row else None
-        stale = (not last_refresh) or (datetime.now() - last_refresh > timedelta(days=1))
+        if row and row[0]:
+            try:
+                last_refresh = datetime.fromisoformat(row[0])
+            except ValueError:
+                last_refresh = None
+        else:
+            last_refresh = None
+
+        # Normalize to UTC-aware if missing tzinfo (assume stored as UTC)
+        if last_refresh is not None and last_refresh.tzinfo is None:
+            last_refresh = last_refresh.replace(tzinfo=timezone.utc)
+
+        # Always compare aware datetimes in UTC
+        now_utc = datetime.now(timezone.utc)
+        stale = (not last_refresh) or (now_utc - last_refresh > timedelta(days=1))
 
         if self.debug_level == 2:
             if not schema_ok:
@@ -255,9 +327,23 @@ class Database:
                     row_vals.append(m.get(col))
             cur.execute(insert_sql, row_vals)
 
+        # --- Update metadata timestamps (UTC-aware) ---
+        cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+
+        # Preserve previous last_refresh -> prev_refresh
+        cur.execute("SELECT value FROM metadata WHERE key='last_refresh'")
+        existing = cur.fetchone()
+        if existing and existing[0]:
+            cur.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('prev_refresh', ?)",
+                (existing[0],)
+            )
+
+        # Write new last_refresh as UTC ISO 8601
+        now_iso = datetime.now(timezone.utc).isoformat()
         cur.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_refresh', ?)" ,
-            (datetime.now().isoformat(),)
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_refresh', ?)",
+            (now_iso,)
         )
         conn.commit()
 

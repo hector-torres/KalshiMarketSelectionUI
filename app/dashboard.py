@@ -4,6 +4,8 @@ import numpy as np
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder
 import io
+import datetime as _dt
+
 
 from app.database import Database
 
@@ -17,25 +19,40 @@ class MarketDashboard:
         self.db = Database()
         self.df = pd.DataFrame()
 
-        # UTC time
+        # --- Time Display (UTC and Local) ---
         utc_now = pd.Timestamp.now(tz="UTC")
-        st.sidebar.markdown("---")
-        st.sidebar.header("Current Time")
-        st.sidebar.markdown(f"{utc_now.strftime(TIME_FMT)}")
+        local_now = pd.Timestamp(_dt.datetime.now().astimezone())
 
-        # Sidebar: show current mode/debug level
-        dbg = getattr(self.db, 'debug_level', 0)
-        mode_map = {
-            0: "Production",
-            1: "Force Refresh Mode - API Call Every Run",
-            2: "Offline Mode - No API Calls",
-        }
-        # st.sidebar.markdown(
-        #     f"**Mode:** `{dbg}`"
-        # )
-        st.sidebar.markdown(
-            f"{mode_map.get(dbg, 'Unknown')}"
-        )
+        st.sidebar.markdown(f"**UI Last Updated**")
+        st.sidebar.markdown(f"{utc_now.strftime(TIME_FMT)}")
+        st.sidebar.markdown(f"{local_now.strftime(TIME_FMT)}")
+
+        # # --- Database Last Refresh Time ---
+        # last_db_refresh = self.db.get_last_refresh_time()
+        # st.sidebar.markdown(f"Database Last Updated")
+        #
+        # if last_db_refresh is not None:
+        #     st.sidebar.markdown(f"{last_db_refresh.strftime(TIME_FMT)}")
+        # else:
+        #     st.sidebar.markdown("No refresh time recorded yet_")
+
+        # --- Database Last Refresh Time ---
+        last_db_refresh = self.db.get_last_refresh_time()
+        st.sidebar.markdown(f"**Database Last Updated**")
+
+        if last_db_refresh is not None:
+            # UTC display
+            utc_str = last_db_refresh.strftime(TIME_FMT)
+
+            # Local display (convert from UTC to system local timezone)
+            local_refresh_dt = last_db_refresh.to_pydatetime().astimezone()
+            local_refresh = pd.Timestamp(local_refresh_dt)
+            local_str = local_refresh.strftime(TIME_FMT)
+
+            st.sidebar.markdown(f"{utc_str}")
+            st.sidebar.markdown(f"{local_str}")
+        else:
+            st.sidebar.markdown("_No refresh time recorded yet_")
 
     def load_data(self):
         # Fetch markets (DB layer will refresh if needed)
@@ -63,7 +80,6 @@ class MarketDashboard:
 
     def render(self):
         # — Sidebar: Search & Filters —
-        st.sidebar.header("Search & Filters")
         search_term = st.sidebar.text_input("Search")
 
         # — Sidebar: Category Filter —
@@ -71,7 +87,6 @@ class MarketDashboard:
         selected_cats = st.sidebar.multiselect("Category", options=cats, default=cats)
 
         # — Sidebar: Time-to-Close Filter —
-        st.sidebar.header("Time to Close")
         max_close_val = int(self.df["days_to_close"].max()) if len(self.df) else 0
         min_days, max_days = st.sidebar.slider(
             "Days until close",
@@ -83,7 +98,6 @@ class MarketDashboard:
         )
 
         # — Sidebar: Price Range Filter —
-        st.sidebar.header("Price Range")
         price_min, price_max = st.sidebar.slider(
             "Price range ($)",
             min_value=0.00,
@@ -94,8 +108,7 @@ class MarketDashboard:
         )
 
         # — Sidebar: Pagination —
-        st.sidebar.header("Pagination")
-        page_size = st.sidebar.number_input("Rows per page", 1, 100, 20, step=1)
+        page_size = st.sidebar.number_input("Rows per page", 1, 100, 30, step=1)
 
         # — Apply Filters —
         df_filtered = self.df.copy()
@@ -119,6 +132,18 @@ class MarketDashboard:
         # Price range filter
         df_filtered = df_filtered[df_filtered["last_price_dollars"].between(price_min, price_max)]
 
+        # — Sidebar: Only markets opened since last update —
+        cutoff_ts = self.db.get_last_update_cutoff()
+        show_since_last = st.sidebar.checkbox(
+            "Show only markets opened since last update",
+            value=False,
+            help="Filters to markets with open_time on/after the last database update (previous run if a rebuild occurred)."
+        )
+        if show_since_last and cutoff_ts is not None:
+            df_filtered = df_filtered[df_filtered["open_time_dt"] >= cutoff_ts]
+            # Optional: display the cutoff time for clarity
+            st.sidebar.caption(f"Cutoff (UTC): {cutoff_ts.strftime('%Y-%m-%d %H:%M %Z')}")
+
         # — Sidebar: Export (Excel) —
         export_cols = [
             "market_event_ticker", "title", "sub_title", "event_title",
@@ -132,7 +157,7 @@ class MarketDashboard:
         xlsx_bytes = self._to_excel_bytes(df_export)
         fname = f"markets_filtered_{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d_%H%M%S')}Z.xlsx"
         st.sidebar.download_button(
-            label="Download filtered as Excel (.xlsx)",
+            label="Download selection as xlsx",
             data=xlsx_bytes,
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -146,6 +171,17 @@ class MarketDashboard:
         start, end = (page - 1) * page_size, page * page_size
         df_page = df_filtered.iloc[start:end].copy()
 
+        # Sidebar: show current mode/debug level
+        dbg = getattr(self.db, 'debug_level', 0)
+        mode_map = {
+            0: "Production",
+            1: "Force Refresh Mode - API Call Every Run",
+            2: "Offline Mode - No API Calls",
+        }
+
+        st.sidebar.markdown(
+            f"Mode: {mode_map.get(dbg, 'Unknown')}"
+        )
 
         # Grid display tweaks
         df_page["last_price_dollars"] = df_page["last_price_dollars"].round(2)
@@ -174,8 +210,6 @@ class MarketDashboard:
         gb.configure_column("days_to_close", maxWidth=125)
         gb.configure_column("last_price_dollars", maxWidth=135)
 
-
-
         grid_opts = gb.build()
 
         grid_response = AgGrid(
@@ -183,7 +217,8 @@ class MarketDashboard:
             gridOptions=grid_opts,
             enable_enterprise_modules=False,
             fit_columns_on_grid_load=True,
-            height=620,
+            # height=620,
+            height=915,
             width="100%",
         )
 
